@@ -1,4 +1,4 @@
-;;; elcord.el --- Allows you to integrate Rich Presence from Discord
+;;; elcord.el --- Allows you to integrate Rich Presence from Discord -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2017 heatingdevice
 
@@ -29,6 +29,9 @@
 (require 'cl-lib)
 (require 'json)
 (require 'subr-x)
+(when (eq system-type 'windows-nt)
+    (load-library "elcord-native")
+    (require 'elcord-native))
 
 (defgroup elcord nil
   "Options for elcord."
@@ -286,15 +289,14 @@ nil when elcord is not active.")
 (defvar elcord--last-known-buffer-name (buffer-name)
   "Last known buffer recorded by elcord.")
 
-(defvar elcord--stdpipe-path (expand-file-name
-                              "stdpipe.ps1"
-                              (file-name-directory (file-truename load-file-name)))
-  "Path to the 'stdpipe' script.
-On Windows, this script is used as a proxy for the Discord named pipe.
-Unused on other platforms.")
-
 (defvar elcord--idle-status nil
   "Current idle status.")
+
+(defun elcord--needs-native()
+  "Returns whether the elcord-native module needs to be loaded on this platform."
+  (if (eq system-type 'windows-nt)
+    't
+    nil))
 
 (defun elcord--find-discord-ipc-pipe ()
   "Find the path to the Discord IPC pipe."
@@ -323,27 +325,15 @@ Unused on other platforms.")
 (defun elcord--make-process ()
   "Make the asynchronous process that communicates with Discord IPC."
   (let ((default-directory "~/"))
-    (cl-case system-type
-      (windows-nt
-       (make-process
-        :name "*elcord-sock*"
-        :command (list
-                  "PowerShell"
-                  "-NoProfile"
-                  "-ExecutionPolicy" "Bypass"
-                  "-Command" elcord--stdpipe-path "." (format elcord--discord-ipc-pipe-format 0))
-        :connection-type 'pipe
-        :sentinel 'elcord--connection-sentinel
-        :filter 'elcord--connection-filter
-        :noquery t))
-      (t
-       (make-network-process
+    (unless (elcord--needs-native)
+      (make-network-process
         :name "*elcord-sock*"
         :remote (elcord--find-discord-ipc-pipe)
         :service nil
         :sentinel 'elcord--connection-sentinel
         :filter 'elcord--connection-filter
-        :noquery t)))))
+        :noquery t)
+      )))
 
 (defun elcord--enable ()
   "Called when variable ‘elcord-mode’ is enabled."
@@ -352,9 +342,7 @@ Unused on other platforms.")
     (warn "elcord: no elcord-client-id available"))
   (when (eq system-type 'windows-nt)
     (unless (executable-find "powershell")
-      (warn "elcord: powershell not available"))
-    (unless (file-exists-p elcord--stdpipe-path)
-      (warn "elcord: 'stdpipe' script does not exist (%s)" elcord--stdpipe-path)))
+      (warn "elcord: powershell not available")))
   (when elcord-idle-timer
     (run-with-idle-timer
      elcord-idle-timer t 'elcord--start-idle))
@@ -427,20 +415,22 @@ Argument EVNT The available output from the process."
 
 (defun elcord--connect ()
   "Connects to the Discord socket."
-  (or elcord--sock
       (ignore-errors
         (unless elcord-quiet
-          (message "elcord: attempting reconnect.."))
-        (setq elcord--sock (elcord--make-process))
-        (condition-case nil
-            (elcord--send-packet 0 `(("v" . 1) ("client_id" . ,(elcord--resolve-client-id))))
-          (error
-           (delete-process elcord--sock)
-           (setq elcord--sock nil)))
-        elcord--sock)))
+          (message "elcord: attempting reconnect..")) 
+        (let* ((handshake-res
+                (if (elcord--needs-native)
+                  (elcord--native-connect)
+                  (progn
+                    (setq elcord--sock (elcord--make-process))
+                      elcord--sock)))
+               (dispatch (elcord--send-packet 0 `(("v" . 1) ("client_id" . ,(elcord--resolve-client-id))))))
+          handshake-res)))
 
 (defun elcord--disconnect ()
   "Disconnect elcord."
+  (when (elcord--needs-native)
+    (elcord--native-disconnect))
   (when elcord--sock
     (delete-process elcord--sock)
     (setq elcord--sock nil)))
@@ -452,6 +442,9 @@ Argument EVNT The available output from the process."
     ;; Put a pending message unless we already got first handshake
     (unless (or elcord--update-presence-timer elcord-quiet)
       (message "elcord: connecting..."))
+    (when (elcord--needs-native)
+        (elcord--start-updates)
+        (elcord--cancel-reconnect))
     (elcord--cancel-reconnect)))
 
 (defun elcord--start-reconnect ()
@@ -494,9 +487,13 @@ Argument OBJ The data to send to the IPC server."
            message-spec
            `((:op . ,opcode)
              (:len . ,datalen)
-             (:data . ,jsonstr)))))
-    (when elcord--sock
-      (process-send-string elcord--sock packet))))
+             (:data . ,jsonstr))))
+         (result (if elcord--sock
+                     (progn (process-send-string elcord--sock packet)
+                            jsonstr)
+                      (elcord--native-send-message opcode jsonstr))))
+    (message "res -> %s" result)
+    result))
 
 (defun elcord--test-match-p (test mode)
   "Test `MODE' against `TEST'.
