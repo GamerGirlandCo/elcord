@@ -1,0 +1,5 @@
+build/
+.cache/
+cmake_install.cmake
+build.ninja
+compile_commands.json
