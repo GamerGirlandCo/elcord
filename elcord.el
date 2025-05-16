@@ -29,6 +29,10 @@
 (require 'cl-lib)
 (require 'json)
 (require 'subr-x)
+(require 'project)
+(require 'projectile)
+(require 'vc)
+(require 'vc-git)
 
 (defgroup elcord nil
   "Options for elcord."
@@ -198,15 +202,14 @@ The mode text is the same found by `elcord-mode-text-alist'"
   :type 'boolean
   :group 'elcord)
 
-(defcustom elcord-display-line-numbers 't
-  "When enabled, shows the total line numbers of current buffer.
-Including the position of the cursor in the buffer."
-  :type 'boolean
-  :group 'elcord)
-
 (defcustom elcord-buffer-details-format-function 'elcord-buffer-details-format
   "Function to return the buffer details string shown on discord.
 Swap this with your own function if you want a custom buffer-details message."
+  :type 'function
+  :group 'elcord)
+(defcustom elcord-buffer-state-format-function 'elcord-buffer-state-format
+  "Function to return the activity state string shown on discord.
+Swap this with your own function if you want a custom string."
   :type 'function
   :group 'elcord)
 
@@ -295,6 +298,9 @@ Unused on other platforms.")
 
 (defvar elcord--idle-status nil
   "Current idle status.")
+
+(defvar elcord--buffer-times nil
+  "An alist which maps a buffer name to an entry containing timestamps corresponding to the when that buffer was first opened and last active.")
 
 (defun elcord--find-discord-ipc-pipe ()
   "Find the path to the Discord IPC pipe."
@@ -602,27 +608,57 @@ If no text is available, use the value of `mode-name'."
        (cons "large_image" large-image)
        (cons "small_text" small-text))))))
 
-(defun elcord-buffer-details-format ()
+(defun elcord--create-template-values ()
+  "Creates an the parameter passed to `elcord-buffer-details-format-function' and `elcord-buffer-state-format-function'."
+  (let* ((proj-name
+            (alist-get 'elcord-project-name dir-local-variables-alist (projectile-project-name)))
+         (proj-description
+            (alist-get 'elcord-project-name dir-local-variables-alist ""))
+         (application-name elcord--editor-name)
+         (file-name (file-name-nondirectory (or (buffer-file-name) "")))
+         (file-path (abbreviate-file-name (or (buffer-file-name) "")))
+         (file-size (format-mode-line "%I"))
+         (file-line (format-mode-line "%l"))
+         (file-line-count
+            (+ 1 (count-lines (point-min) (point-max))))
+         (vcs-branch
+            (or (car (vc-git-branches)) "<no-branch>"))
+         )
+
+    `(
+      ("projectName" . ,proj-name)
+      ("projectDescription" . ,proj-description)
+      ("applicationName" . ,application-name)
+      ("fileSize" . ,file-size)
+      ("vcsBranch" . ,vcs-branch)
+      ("fileLineCount". ,file-line-count)
+      ("fileLine" . ,file-line)
+      ("filePath" . ,file-path)
+      ("fileName". ,file-name)
+    )))
+
+(defun elcord-buffer-details-format (unused)
   "Return the buffer details string shown on discord."
   (format "Editing %s" (buffer-name)))
+
+(defun elcord-buffer-state-format (unused)
+  "Return the activity state shown on discord."
+      (format "Line %s of %S" (format-mode-line "%l") (+ 1 (count-lines (point-min) (point-max))))
+)
 
 (defun elcord--details-and-state ()
   "Obtain the details and state to use for Discord's Rich Presence."
   (let ((activity (if elcord-display-buffer-details
-                      (if elcord-display-line-numbers
-                          (list
-                           (cons "details" (funcall elcord-buffer-details-format-function))
-                           (cons "state" (format "Line %s of %S"
-                                                 (format-mode-line "%l")
-                                                 (+ 1 (count-lines (point-min) (point-max))))))
-                        (list
-                         (cons "details" (funcall elcord-buffer-details-format-function))))
+                    (list
+                      (cons "details" (funcall elcord-buffer-details-format-function (elcord--create-template-values)))
+                      (cons "state" (funcall elcord-buffer-state-format-function (elcord--create-template-values))))
                     (list
                      (cons "details" "Editing")
                      (cons "state" (elcord--mode-text))))))
     (when elcord-display-elapsed
-      (push (list "timestamps" (cons "start" elcord--startup-time)) activity))
-    activity))
+      (push (list "timestamps" (cons "start"
+                                     (or (alist-get 'active (cdr (assq elcord--last-known-buffer-name elcord--buffer-times)))
+                                        elcord--startup-time))) activity))))
 
 (defun elcord--set-presence ()
   "Set presence."
@@ -660,8 +696,32 @@ If no text is available, use the value of `mode-name'."
           (setq cell (cdr cell)))))
     result))
 
+(defun elcord--get-buffer-project (cur-buffer-name)
+  "Gets the project to which `CUR-BUFFER-NAME' belongs, otherwise nil."
+  (let ((maybe-project (cdr (project-projectile (file-name-directory (or (buffer-file-name (get-buffer cur-buffer-name)) ""))))))
+    (if (string= maybe-project "")
+        nil
+      maybe-project)))
+
+(defun elcord--add-buffer-time (new-buffer-name)
+  "Adds or updates `NEW-BUFFER-NAME''s entry in the `elcord--buffer-times' alist."
+  (cond
+   ((assq new-buffer-name elcord--buffer-times)
+    (unless (string= new-buffer-name (or elcord--last-known-buffer-name ""))
+      (setcdr (assq 'active (assq new-buffer-name elcord--buffer-times))
+            (string-to-number (format-time-string "%s" (current-time))))))
+   (t
+    (setq elcord--buffer-times
+      (append elcord--buffer-times (list
+        (cons new-buffer-name
+          (list
+            (cons 'opened (string-to-number (format-time-string "%s" (current-time))))
+            (cons 'active (string-to-number (format-time-string "%s" (current-time)))))
+        )))))))
+
 (defun elcord--try-update-presence (new-buffer-name new-buffer-position)
   "Try updating presence with `NEW-BUFFER-NAME' and `NEW-BUFFER-POSITION' while handling errors and disconnections."
+  (elcord--add-buffer-time new-buffer-name)
   (setq elcord--last-known-buffer-name new-buffer-name
         elcord--last-known-position new-buffer-position)
   (condition-case err
@@ -696,7 +756,9 @@ If there is no 'previous' buffer attempt to find a non-boring buffer to initiali
     (unless elcord-quiet
       (message "elcord: connected. starting updates"))
     ;;Start sending updates now that we've heard from discord
-    (setq elcord--last-known-position -1
+    (setq
+     elcord--buffer-times nil
+     elcord--last-known-position -1
           elcord--last-known-buffer-name ""
           elcord--update-presence-timer (run-at-time 0 elcord-refresh-rate 'elcord--update-presence))))
 
